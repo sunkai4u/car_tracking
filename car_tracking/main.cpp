@@ -787,6 +787,7 @@ public:
     unsigned long getHead() const { return head; }
     unsigned long getTail() const { return tail; }
     unsigned long getSize() const { return tail-head; }
+    unsigned long capacity() const { return size; }
 };
 void testMyList()
 {
@@ -803,90 +804,114 @@ void testMyList()
     }
 }
 
-enum FRAME_STATUS { nochanged=0, up, down};
-enum PEAK_STATUS { no, yes, maybe };
+enum VALUE_STATUS { nochanged=0, up, down};
+enum FRAME_STATUS { no, yes, maybe };
 struct FrameInfo
 {
-    unsigned long nFrame;
-    FRAME_STATUS status; //
     float v;
-    PEAK_STATUS bpeak;
+    VALUE_STATUS vstatus; //
+    FRAME_STATUS fstatus;
 };
-void show(MyList<FrameInfo>& list, Mat img)
-{
-    img = Mat::zeros(img.size(), CV_8U);
-    Point p1;
-    p1.x = 0;
-    p1.y = 0;
-    for(unsigned long k=list.getHead(); k<list.getTail(); ++k)
-    {
-        Point p2;
-        p2.x = k-list.getHead();
-        FrameInfo& v = list.get(k);
-        p2.y = img.rows-v.v*img.rows;
-        line(img, p1, p2, Scalar(128));
-        if(v.bpeak==yes)
-        {
-            circle(img, p2, 1, Scalar(255), 2);
-        }
-        p1 = p2;
-    }
-}
 
-PEAK_STATUS update(MyList<FrameInfo>& list)
+class Detector
 {
-    const unsigned long cFrame = list.getTail()-1;
-    const unsigned long maxHistory = 45;
-    FrameInfo& v = list.get(cFrame);
-    const float candidateThre = 0.02;
-    if(list.getSize() > maxHistory)
+private:
+    MyList<FrameInfo> list;
+    double fps;
+    
+public:
+    Detector(double _fps, unsigned int list_bits) : fps(_fps), list(list_bits)
     {
-        FrameInfo& pv = list.get(cFrame-1);
-        v.v = (v.v+pv.v)*0.5;
-        if(v.v > candidateThre)
+        
+    }
+    unsigned long capacity() const { return list.capacity(); }
+    FRAME_STATUS update(FrameInfo _v)
+    {
+        list.add(_v);
+        
+        const unsigned long cFrame = list.getTail()-1;
+        const unsigned long maxHistory = min((unsigned long)(fps*3), list.getSize()-1);
+        FrameInfo& v = list.get(cFrame);
+        const float candidateThre = 0.02;
+        if(list.getSize() > maxHistory)
         {
-            if(v.v >= pv.v)
+            FrameInfo& pv = list.get(cFrame-1);
+            v.v = (v.v+pv.v)*0.5;
+            if(v.v > candidateThre)
             {
-                v.status = up;
-                v.bpeak = maybe;
+                if(v.v >= pv.v)
+                {
+                    v.vstatus = up;
+                    v.fstatus = maybe;
+                }
+                else
+                {
+                    unsigned int i=0;
+                    unsigned int nCount = 0;
+                    const unsigned int maxNoCount = 3;
+                    for(i=0; i<maxHistory; ++i)
+                    {
+                        FrameInfo& tv = list.get(cFrame-1-i);
+                        if(tv.fstatus == yes)
+                        {
+                            nCount=0;
+                            v.fstatus = maybe;
+                            break;
+                        }
+                        else if(tv.fstatus==maybe)
+                        {
+                            nCount = 0;
+                            v.fstatus = maybe;
+                        }
+                        else if(tv.fstatus == no)
+                        {
+                            nCount++;
+                            v.fstatus = maybe;
+                        }
+                    }
+                    if(i==maxHistory || nCount>maxNoCount)
+                    {
+                        v.fstatus = yes;
+                    }
+                }
             }
             else
             {
-                unsigned int i=0;
-                for(i=0; i<maxHistory; ++i)
-                {
-                    FrameInfo& tv = list.get(cFrame-1-i);
-                    if(tv.bpeak == yes)
-                    {
-                        v.bpeak = maybe;
-                        break;
-                    }
-                    else if(tv.bpeak == no)
-                    {
-                        v.bpeak = yes;
-                        break;
-                    }
-                }
-                if(i==maxHistory)
-                {
-                    v.bpeak = yes;
-                }
+                v.fstatus = no;
+                v.vstatus = nochanged;
             }
+            
         }
         else
-        {
-            v.bpeak = no;
-            v.status = nochanged;
+        { 
+            v.fstatus = no;
+            v.vstatus = nochanged;
         }
+        return v.fstatus;
+    }
+    
+    void show(Mat& img)
+    {
+        img = Mat::zeros(img.size(), CV_8U);
+        Point p1;
+        p1.x = 0;
+        p1.y = 0;
+        for(unsigned long k=list.getHead(); k<list.getTail(); ++k)
+        {
+            Point p2;
+            p2.x = k-list.getHead();
+            FrameInfo& v = list.get(k);
+            p2.y = img.rows-v.v*img.rows;
+            line(img, p1, p2, Scalar(128));
+            if(v.fstatus==yes)
+            {
+                circle(img, p2, 1, Scalar(255), 2);
+            }
+            p1 = p2;
+        }
+    }
+};
 
-    }
-    else
-    { 
-        v.bpeak = no;
-        v.status = nochanged;
-    }
-    return v.bpeak;
-}
 int main(int argc, char* argv[])
 {
     VideoCapture cap;
@@ -925,9 +950,8 @@ int main(int argc, char* argv[])
         }
     }
     const int listBits = 9;
-    const int listSize = 1<<listBits;
-    MyList<FrameInfo> info_list(listBits);
-    Mat info(512, listSize, CV_8U);
+    Detector detector(cap.get(CV_CAP_PROP_FPS), listBits);
+    Mat info(512, detector.capacity(), CV_8U);
     cap>>frame;
     unsigned long nFrame = 0;
     while (!frame.empty() && waitKey(30)!=27)
@@ -941,22 +965,20 @@ int main(int argc, char* argv[])
         
         IplImage image = IplImage(roiImg);
         bgfg->Process(&image);
-        mask= Mat(bgfg->GetMask());
+        mask= Mat(bgfg->GetMask()).clone();
         multiply(mask, weight, mask, 1, CV_32F);
         FrameInfo v;
         v.v = sum(mask)[0]/(255*mask.rows*mask.cols);
-        v.nFrame = nFrame; 
-        info_list.add(v);
-        PEAK_STATUS bpeak = update(info_list);
+        FRAME_STATUS status = detector.update(v);
         
-        show(info_list, info);
+        detector.show(info);
         Scalar color;
-        if(bpeak==yes)
+        if(status==yes)
         {
             color = Scalar(0, 0, 255);
             cout<<nFrame<<'\t';
         }
-        else if(bpeak==maybe)
+        else if(status==maybe)
             color = Scalar(255, 0, 0);
         else
             color = Scalar(0, 255, 0);
